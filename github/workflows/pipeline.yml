@@ -1,0 +1,101 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ML CI/CD Pipeline
+# Triggers on every push to any branch (and every PR to main).
+# Steps:
+#   1. Install dependencies
+#   2. Train model  → saves model/model.pkl
+#   3. Evaluate     → fails pipeline if accuracy < 0.80
+#   4. Start Flask API (smoke-test)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: ML CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]          # every branch push
+  pull_request:
+    branches: [main]
+
+jobs:
+  ml-pipeline:
+    name: Train → Evaluate → Deploy (smoke-test)
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout code ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"           # cache pip deps across runs for speed
+
+      # ── 3. Install dependencies ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Create model directory ────────────────────────────────────────────
+      - name: Create model directory
+        run: mkdir -p model
+
+      # ── 5. Train model ───────────────────────────────────────────────────────
+      - name: Train model
+        run: python train.py
+
+      # ── 6. Evaluate model (gate: accuracy must be >= 0.80) ───────────────────
+      - name: Evaluate model
+        run: python evaluate.py
+        # evaluate.py exits with code 1 if accuracy < 0.80,
+        # which automatically fails this step and stops the pipeline.
+
+      # ── 7. Upload model artifact ─────────────────────────────────────────────
+      - name: Upload trained model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: model/model.pkl
+          retention-days: 7
+
+      # ── 8. Smoke-test Flask API ──────────────────────────────────────────────
+      - name: Start Flask API (background)
+        run: |
+          python app.py &
+          echo "APP_PID=$!" >> $GITHUB_ENV
+          sleep 3   # give Flask time to start
+
+      - name: Smoke-test /health endpoint
+        run: |
+          curl --fail --silent --show-error \
+            http://localhost:5000/health | python -m json.tool
+
+      - name: Smoke-test /predict endpoint
+        run: |
+          # Build a 20-feature array of zeros as a minimal sanity-check
+          FEATURES=$(python -c "import json; print(json.dumps({'features': [0.0]*20}))")
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$FEATURES" \
+            http://localhost:5000/predict | python -m json.tool
+
+      - name: Shut down Flask API
+        if: always()
+        run: kill $APP_PID 2>/dev/null || true
+
+      # ── 9. Summary ───────────────────────────────────────────────────────────
+      - name: Pipeline summary
+        if: success()
+        run: |
+          echo "### ✅ ML Pipeline Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Install dependencies | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Train model          | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Evaluate (≥ 80%)     | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flask API smoke-test | ✅ |" >> $GITHUB_STEP_SUMMARY
