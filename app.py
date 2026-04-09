@@ -1,24 +1,44 @@
 """
-app.py - Flask REST API for serving ML model predictions.
+app.py - Sprint 3: Flask REST API for Wine Model
+==================================================
+Serves the trained XGBoost Wine classifier via a REST API.
 
 Endpoints:
   GET  /health          → liveness check
-  GET  /model/info      → model metadata
-  POST /predict         → single prediction
-  POST /predict/batch   → batch predictions
+  GET  /model/info      → model metadata & hyperparameters
+  GET  /metrics         → latest evaluation metrics from metrics.json
+  POST /predict         → single-sample prediction  (13 features)
+  POST /predict/batch   → multi-sample predictions   (N × 13 features)
 """
 
 import os
+import json
 import pickle
 import numpy as np
 from flask import Flask, jsonify, request
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-MODEL_PATH = os.path.join("model", "model.pkl")
 
-# ── Load model once at startup ────────────────────────────────────────────────
-def load_model(path: str):
+MODEL_DIR = "model"
+MODEL_PATH = os.path.join(MODEL_DIR, "model.pkl")
+METRICS_PATH = os.path.join(MODEL_DIR, "metrics.json")
+
+# Wine dataset class names (matching sklearn.datasets.load_wine)
+CLASS_NAMES = {0: "class_0", 1: "class_1", 2: "class_2"}
+
+# Wine dataset feature names (13 features)
+FEATURE_NAMES = [
+    "alcohol", "malic_acid", "ash", "alcalinity_of_ash", "magnesium",
+    "total_phenols", "flavanoids", "nonflavanoid_phenols",
+    "proanthocyanins", "color_intensity", "hue",
+    "od280/od315_of_diluted_wines", "proline",
+]
+
+
+# ── Load model once at startup ───────────────────────────────────────────────
+def load_model_bundle(path: str):
+    """Load the pickled model + scaler bundle."""
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Model file not found at '{path}'. "
@@ -28,45 +48,88 @@ def load_model(path: str):
         return pickle.load(f)
 
 
-bundle = load_model(MODEL_PATH)
+bundle = load_model_bundle(MODEL_PATH)
 MODEL = bundle["model"]
 SCALER = bundle["scaler"]
-
-N_FEATURES = MODEL.n_features_in_
-CLASS_NAMES = {0: "Class 0", 1: "Class 1"}
+N_FEATURES = MODEL.n_features_in_  # Expected: 13
 
 print(f"✅ Model loaded — expects {N_FEATURES} features")
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def validate_features(features: list) -> np.ndarray:
     """Validate and reshape a flat list of feature values."""
+    if not isinstance(features, list):
+        raise ValueError("'features' must be a list of numbers.")
     if len(features) != N_FEATURES:
         raise ValueError(
-            f"Expected {N_FEATURES} features, got {len(features)}."
+            f"Expected {N_FEATURES} features, got {len(features)}. "
+            f"Features: {FEATURE_NAMES}"
         )
-    return np.array(features, dtype=float).reshape(1, -1)
+    try:
+        return np.array(features, dtype=float).reshape(1, -1)
+    except (ValueError, TypeError):
+        raise ValueError("All feature values must be numeric.")
+
+
+def load_metrics():
+    """Read metrics.json from disk. Returns dict or None."""
+    if not os.path.exists(METRICS_PATH):
+        return None
+    with open(METRICS_PATH, "r") as f:
+        return json.load(f)
+
+
+def format_prediction(pred, probabilities):
+    """Format a single prediction result."""
+    return {
+        "prediction": int(pred),
+        "label": CLASS_NAMES.get(int(pred), str(pred)),
+        "probabilities": {
+            CLASS_NAMES.get(i, str(i)): round(float(p), 4)
+            for i, p in enumerate(probabilities)
+        },
+    }
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
 @app.route("/health", methods=["GET"])
 def health():
-    """Liveness probe."""
-    return jsonify({"status": "ok", "model_loaded": MODEL is not None}), 200
+    """Liveness probe — confirms the API and model are operational."""
+    return jsonify({
+        "status": "ok",
+        "model_loaded": MODEL is not None,
+    }), 200
 
 
 @app.route("/model/info", methods=["GET"])
 def model_info():
     """Return metadata about the loaded model."""
-    return jsonify(
-        {
-            "model_type": type(MODEL).__name__,
-            "n_features": N_FEATURES,
-            "n_classes": len(MODEL.classes_.tolist()),
-            "classes": MODEL.classes_.tolist(),
+    return jsonify({
+        "model_type": type(MODEL).__name__,
+        "n_features": N_FEATURES,
+        "feature_names": FEATURE_NAMES,
+        "n_classes": len(MODEL.classes_.tolist()),
+        "classes": MODEL.classes_.tolist(),
+        "class_names": list(CLASS_NAMES.values()),
+        "hyperparameters": {
             "n_estimators": getattr(MODEL, "n_estimators", None),
             "max_depth": getattr(MODEL, "max_depth", None),
-        }
-    ), 200
+            "learning_rate": getattr(MODEL, "learning_rate", None),
+        },
+    }), 200
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """Return the latest evaluation metrics from metrics.json."""
+    data = load_metrics()
+    if data is None:
+        return jsonify({
+            "error": "metrics.json not found. Run evaluate.py first."
+        }), 404
+    return jsonify(data), 200
 
 
 @app.route("/predict", methods=["POST"])
@@ -75,18 +138,21 @@ def predict():
     Single prediction.
 
     Request body (JSON):
-      { "features": [f1, f2, ..., f20] }
+      { "features": [f1, f2, ..., f13] }
 
     Response:
       {
-        "prediction": 0 or 1,
-        "label": "Class 0" or "Class 1",
-        "probabilities": {"Class 0": 0.12, "Class 1": 0.88}
+        "prediction": 0,
+        "label": "class_0",
+        "probabilities": {"class_0": 0.92, "class_1": 0.05, "class_2": 0.03}
       }
     """
     data = request.get_json(force=True, silent=True)
+
     if not data or "features" not in data:
-        return jsonify({"error": "Request body must contain a 'features' key."}), 400
+        return jsonify({
+            "error": "Request body must contain a 'features' key."
+        }), 400
 
     try:
         X = validate_features(data["features"])
@@ -94,39 +160,38 @@ def predict():
         return jsonify({"error": str(exc)}), 400
 
     X_scaled = SCALER.transform(X)
-    pred = int(MODEL.predict(X_scaled)[0])
-    proba = MODEL.predict_proba(X_scaled)[0].tolist()
+    pred = MODEL.predict(X_scaled)[0]
+    proba = MODEL.predict_proba(X_scaled)[0]
 
-    return jsonify(
-        {
-            "prediction": pred,
-            "label": CLASS_NAMES.get(pred, str(pred)),
-            "probabilities": {
-                CLASS_NAMES.get(i, str(i)): round(p, 4)
-                for i, p in enumerate(proba)
-            },
-        }
-    ), 200
+    return jsonify(format_prediction(pred, proba)), 200
 
 
 @app.route("/predict/batch", methods=["POST"])
 def predict_batch():
     """
-    Batch prediction.
+    Batch predictions.
 
     Request body (JSON):
-      { "instances": [[f1...f20], [f1...f20], ...] }
+      { "instances": [[f1...f13], [f1...f13], ...] }
 
     Response:
-      { "predictions": [{"prediction": 1, "label": "Class 1", ...}, ...] }
+      {
+        "predictions": [ {prediction, label, probabilities}, ... ],
+        "count": N
+      }
     """
     data = request.get_json(force=True, silent=True)
+
     if not data or "instances" not in data:
-        return jsonify({"error": "Request body must contain an 'instances' key."}), 400
+        return jsonify({
+            "error": "Request body must contain an 'instances' key."
+        }), 400
 
     instances = data["instances"]
     if not isinstance(instances, list) or len(instances) == 0:
-        return jsonify({"error": "'instances' must be a non-empty list."}), 400
+        return jsonify({
+            "error": "'instances' must be a non-empty list."
+        }), 400
 
     try:
         X = np.array(instances, dtype=float)
@@ -138,18 +203,11 @@ def predict_batch():
         return jsonify({"error": str(exc)}), 400
 
     X_scaled = SCALER.transform(X)
-    preds = MODEL.predict(X_scaled).tolist()
-    probas = MODEL.predict_proba(X_scaled).tolist()
+    preds = MODEL.predict(X_scaled)
+    probas = MODEL.predict_proba(X_scaled)
 
     results = [
-        {
-            "prediction": p,
-            "label": CLASS_NAMES.get(p, str(p)),
-            "probabilities": {
-                CLASS_NAMES.get(i, str(i)): round(pr, 4)
-                for i, pr in enumerate(pb)
-            },
-        }
+        format_prediction(p, pb)
         for p, pb in zip(preds, probas)
     ]
 
