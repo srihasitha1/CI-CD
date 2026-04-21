@@ -161,5 +161,3 @@ def test_predict_invalid_input(client):
     assert response_no_key.status_code == 400, (
         "Missing 'features' key should return 400."
     )
-def test_intentional_failure():
-    assert 1 == 2, "Testing pipeline test failure!"
