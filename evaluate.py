@@ -29,7 +29,7 @@ from sklearn.metrics import (
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-ACCURACY_THRESHOLD = 0.50
+ACCURACY_THRESHOLD = 0.82
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
